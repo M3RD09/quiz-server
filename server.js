@@ -45,7 +45,7 @@ io.on('connection', (socket) => {
     rooms[code] = {
       code, game,
       host: socket.id,
-      players: [{ id: socket.id, name: playerName, ready: false }],
+      players: [{ id: socket.id, name: playerName, ready: false, disconnected: false }],
       state: 'lobby',   // lobby | playing | ended
       quizData: quizData || null,
       gameState: null,
@@ -61,6 +61,30 @@ io.on('connection', (socket) => {
   socket.on('join_room', ({ code, playerName }) => {
     const room = rooms[code];
     if (!room) { socket.emit('error', { msg: 'Raum nicht gefunden!' }); return; }
+
+    // ── Reconnect: player was in this room and is marked disconnected ──
+    const disconnectedPlayer = room.players.find(p => p.name === playerName && p.disconnected);
+    if (disconnectedPlayer) {
+      clearTimeout(disconnectedPlayer.disconnectTimer);
+      const wasHost = room.host === disconnectedPlayer.id;
+      disconnectedPlayer.id = socket.id;
+      disconnectedPlayer.disconnected = false;
+      delete disconnectedPlayer.disconnectTimer;
+      if (wasHost) room.host = socket.id;
+
+      socket.join(code);
+      socket.emit('room_joined', {
+        code,
+        room: sanitizeRoom(room),
+        yourName: playerName,
+        reconnected: true,
+        gameState: room.gameState
+      });
+      io.to(code).emit('player_joined', { room: sanitizeRoom(room), newPlayer: playerName, reconnected: true });
+      console.log(`${playerName} reconnected to ${code}`);
+      return;
+    }
+
     if (room.state !== 'lobby') { socket.emit('error', { msg: 'Spiel läuft bereits!' }); return; }
     if (room.players.length >= 10) { socket.emit('error', { msg: 'Raum voll!' }); return; }
 
@@ -68,7 +92,7 @@ io.on('connection', (socket) => {
     const nameExists = room.players.some(p => p.name === playerName);
     const finalName = nameExists ? playerName + '_' + Math.floor(Math.random()*99) : playerName;
 
-    room.players.push({ id: socket.id, name: finalName, ready: false });
+    room.players.push({ id: socket.id, name: finalName, ready: false, disconnected: false });
     socket.join(code);
 
     socket.emit('room_joined', { code, room: sanitizeRoom(room), yourName: finalName });
@@ -103,7 +127,7 @@ io.on('connection', (socket) => {
     const player = room.players.find(p => p.id === socket.id);
     if (!player) return;
 
-    // Store latest game state for late joiners
+    // Store latest game state for reconnecting players
     if (action === 'state_sync') {
       room.gameState = payload;
     }
@@ -116,7 +140,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ════ HOST SYNC (push full state to all) ════
+  // ════ HOST SYNC (push full state to server for reconnect restore) ════
   socket.on('host_sync', ({ code, gameState }) => {
     const room = rooms[code];
     if (!room || room.host !== socket.id) return;
@@ -145,25 +169,57 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     for (const code in rooms) {
       const room = rooms[code];
-      const idx = room.players.findIndex(p => p.id === socket.id);
-      if (idx === -1) continue;
+      const player = room.players.find(p => p.id === socket.id);
+      if (!player) continue;
 
-      const name = room.players[idx].name;
-      room.players.splice(idx, 1);
+      const name = player.name;
+      const wasHost = room.host === socket.id;
 
-      if (room.host === socket.id) {
-        // Host left — promote next player or close room
-        if (room.players.length > 0) {
-          room.host = room.players[0].id;
-          io.to(code).emit('host_changed', { newHost: room.players[0].name });
-        } else {
-          delete rooms[code];
-          break;
+      if (room.state === 'playing') {
+        // Grace period: mark as disconnected, permanently remove after 60s if no reconnect
+        player.disconnected = true;
+        player.disconnectTimer = setTimeout(() => {
+          const idx = room.players.findIndex(p => p.name === name && p.disconnected);
+          if (idx === -1) return; // Player already reconnected
+
+          room.players.splice(idx, 1);
+
+          if (wasHost) {
+            const next = room.players.find(p => !p.disconnected) || room.players[0];
+            if (next) {
+              room.host = next.id;
+              io.to(code).emit('host_changed', { newHost: next.name });
+            } else {
+              delete rooms[code];
+              return;
+            }
+          }
+
+          if (room.players.length === 0) { delete rooms[code]; return; }
+          io.to(code).emit('player_left', { name, room: sanitizeRoom(room) });
+          console.log(`${name} timed out from ${code}`);
+        }, 60 * 1000);
+
+        io.to(code).emit('player_disconnected', { name, room: sanitizeRoom(room) });
+        console.log(`${name} temporarily disconnected from ${code}`);
+      } else {
+        // Lobby: remove immediately (original behaviour)
+        const idx = room.players.findIndex(p => p.id === socket.id);
+        room.players.splice(idx, 1);
+
+        if (wasHost) {
+          if (room.players.length > 0) {
+            room.host = room.players[0].id;
+            io.to(code).emit('host_changed', { newHost: room.players[0].name });
+          } else {
+            delete rooms[code];
+            break;
+          }
         }
-      }
 
-      io.to(code).emit('player_left', { name, room: sanitizeRoom(room) });
-      console.log(`${name} left ${code}`);
+        io.to(code).emit('player_left', { name, room: sanitizeRoom(room) });
+        console.log(`${name} left ${code}`);
+      }
       break;
     }
     console.log('disconnect', socket.id);
@@ -175,7 +231,12 @@ function sanitizeRoom(room) {
     code: room.code,
     game: room.game,
     state: room.state,
-    players: room.players.map(p => ({ name: p.name, ready: p.ready, isHost: p.id === room.host })),
+    players: room.players.map(p => ({
+      name: p.name,
+      ready: p.ready,
+      isHost: p.id === room.host,
+      disconnected: p.disconnected || false
+    })),
     hostName: room.players.find(p => p.id === room.host)?.name || ''
   };
 }
